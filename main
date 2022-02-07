@@ -1,0 +1,77 @@
+import pandas as pd
+import datetime
+import re
+import pyspark.sql.functions as F
+
+def Queries_History_DS(tech_query, tech_query_note):
+    # CAMO Distribution List Definition
+    camo = ['CAMO','SYSTEMS','VANVEL','STRUCT','XAVMOR','JOHJAR','JASGAR','GUICON','ENGINES','JAUESP','CRIRIB','VERMAR','ALBALM','AVIONIC','RAUQUE','INTERIOR','POLSAB','GLORUI','LANDGEAR','FERFUE','SANMOR','HARDTIME','CARTAD','ELMNEZ','HECMAT','CARROS','MARJUL']
+    
+    # List Definitions
+    dfpy_tq = tech_query.select(['INTERRUPTION_REASON','QUERYNO_I','ASSIGNED_TO','ASSIGNED_TO_GROUP','MUTATOR','MUTATION','STATUS','CREATED_DATE'])
+    dfpy_tqn = tech_query_note.select(['NOTE', 'NOTENO_I','QUERYNO_I','NOTE_TYPE','MUTATION','MUTATOR'])
+
+    # Dates Parsing
+    dfpy_tq = dfpy_tq.withColumn('ref_date', F.when(F.col('CREATED_DATE').isNotNull(),F.lit('1971-12-31')))
+    dfpy_tqn = dfpy_tqn.withColumn('ref_date', F.when(F.col('MUTATION').isNotNull(),F.lit('1971-12-31')))
+
+    dfpy_tq = dfpy_tq.withColumn('MUTATION', F.col('MUTATION').cast('integer'))
+    dfpy_tq = dfpy_tq.withColumn('MUTATION', F.expr("date_add(ref_date, MUTATION)"))
+    dfpy_tq = dfpy_tq.withColumn('CREATED_DATE', F.col('CREATED_DATE').cast('integer'))
+    dfpy_tq = dfpy_tq.withColumn('CREATED_DATE', F.expr("date_add(ref_date, CREATED_DATE)"))
+
+    dfpy_tqn = dfpy_tqn.withColumn('MUTATION', F.col('MUTATION').cast('integer'))
+    dfpy_tqn = dfpy_tqn.withColumn('MUTATION', F.expr("date_add(ref_date, MUTATION)"))
+
+
+
+    # Tables Pre-Processing
+    dfpy_tq = dfpy_tq.where(F.col('CREATED_DATE') >= F.lit('2018-01-01'))
+
+    # Transformation from PySpark to Pandas Dataframe
+    dfpd_tq = dfpy_tq.toPandas()
+    dfpd_tqn = dfpy_tqn.toPandas()
+
+    # Tables Pre-Proccesing
+    dfpd_tqn = dfpd_tqn.rename({'MUTATION': 'N_MUTATION', 'MUTATOR': 'N_MUTATOR'}, axis=1)
+
+    temp = dfpd_tqn.merge((dfpd_tqn.groupby(['QUERYNO_I','N_MUTATION'])['NOTENO_I'].max().reset_index()),on=['QUERYNO_I','NOTENO_I'], how='inner')
+
+    temp = temp.rename({'N_MUTATION_x': 'N_MUTATION'}, axis=1)
+    temp = temp.drop(['N_MUTATOR','N_MUTATION_y'], axis=1)
+
+    temp['NOTE'] = temp['NOTE'].apply(lambda x: str(x).replace('\xa0', 'Closed'))
+
+    # List Comprehension
+    temp['ASSIGN'] = [ str(x).split('.')[0].split()[2] if str(x).startswith('Assigned to') else str(x) for x in temp['NOTE'] ]
+    temp['ASSIGN'] = [ str(x).split('. Assigned to group ')[-1].split('.')[0] if bool(re.search('. Assigned to group',str(x))) else x for x in temp['ASSIGN'] ]
+    temp['ASSIGN'] = [ str(x).split('Reassigned from ')[1].split('.')[0].split()[-1] if str(x).startswith('Reassigned from ') else str(x) for x in temp['ASSIGN'] ]
+    temp['ASSIGN'] = [ str(x).split('. Reassigned from ')[1].split('.')[0].split()[-1] if bool(re.search('. Reassigned from ',str(x))) else x for x in temp['ASSIGN'] ]
+    temp['ASSIGN'] = [ str(x).split()[0] if bool(re.search(' query to himself/herself',str(x))) else x for x in temp['ASSIGN'] ]
+    
+    # COSAS RARAS
+    temp = temp.merge(dfpd_tq, on=['QUERYNO_I'], how='inner')
+    dfpd_tqn_closed = temp[['QUERYNO_I','NOTE_TYPE','N_MUTATION']].where(temp['NOTE_TYPE'] == 'C')
+    dfpd_tqn_closed = dfpd_tqn_closed[dfpd_tqn_closed['NOTE_TYPE'] == 'C']
+    dfpd_tqn_closed = dfpd_tqn_closed.rename({'N_MUTATION':'CLOSING_DATE'}, axis=1)
+    dfpd_tqn_closed = dfpd_tqn_closed[['QUERYNO_I','CLOSING_DATE']]
+
+    temp = temp.merge(dfpd_tqn_closed, on=['QUERYNO_I'], how='left')
+
+    # Dates generator
+    datelist = pd.date_range(end = datetime.datetime.today(), periods = 1400).to_pydatetime().tolist()
+    fechas = []
+    for date in range(len(datelist)):
+        fechas.append(str(datelist[date])[0:10])    #lista
+
+    df2 = pd.DataFrame()
+    for fecha in fechas:
+        df1 = temp.groupby(temp.loc[ (temp['CREATED_DATE'] <= pd.to_datetime(fecha).date() ) & (temp['N_MUTATION'] <= pd.to_datetime(fecha).date()) &((temp['CLOSING_DATE'].isnull()) | (temp['CLOSING_DATE'] > pd.to_datetime(fecha).date() )) & (temp['NOTE_TYPE'] != 'C') & (temp['ASSIGN'].isin(camo)), 'QUERYNO_I'])['N_MUTATION'].max().reset_index()
+        df1['REF_DATE'] = fecha
+        df1['REF_DATE'] = pd.to_datetime(df1['REF_DATE']).dt.date
+        df2 = df2.append(df1, ignore_index=True)
+        del(df1)
+
+    df = temp.merge(df2, on=['QUERYNO_I', 'N_MUTATION'], how='inner').sort_values(by=['QUERYNO_I','REF_DATE'])
+    df = df[['QUERYNO_I', 'N_MUTATION', 'ASSIGN', 'CREATED_DATE','CLOSING_DATE', 'REF_DATE']].drop_duplicates()
+    return df
